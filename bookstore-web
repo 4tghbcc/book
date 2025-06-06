@@ -1,0 +1,192 @@
+
+```python
+from flask import Flask, render_template, request, redirect, url_for, session, flash
+from flask_session import Session
+import sqlite3
+import datetime
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'bookshop_secret'
+app.config['SESSION_TYPE'] = 'filesystem'
+Session(app)
+DB_NAME = "bookstore.db"
+
+# ---------- Helpers for DB ----------
+def db_connect():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = db_connect()
+    c = conn.cursor()
+    c.executescript("""
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE,
+    password TEXT,
+    role TEXT CHECK(role in ('user','admin'))
+);
+
+CREATE TABLE IF NOT EXISTS books (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT,
+    author TEXT,
+    category TEXT,
+    year INTEGER,
+    price REAL,
+    status TEXT CHECK(status in ('available','rented','sold')),
+    description TEXT
+);
+
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    book_id INTEGER,
+    order_type TEXT CHECK(order_type in ('buy','rent')),
+    rent_period TEXT,
+    rent_start DATE,
+    rent_end DATE,
+    FOREIGN KEY(user_id) REFERENCES users(id),
+    FOREIGN KEY(book_id) REFERENCES books(id)
+);
+""")
+    # Add admin account and example books if DB is empty
+    c.execute("SELECT * FROM users")
+    if not c.fetchall():
+        c.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", ("admin", "admin", "admin"))
+        c.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", ("user", "user", "user"))
+    c.execute("SELECT * FROM books")
+    if not c.fetchall():
+        books = [
+            ("Гарри Поттер и философский камень", "Дж.К. Роулинг", "Фэнтези", 1997, 500, "available", "Первая книга о Гарри Поттере"),
+            ("Преступление и наказание", "Фёдор Достоевский", "Классика", 1866, 350, "available", "Роман Ф.М. Достоевского"),
+            ("Война и мир", "Лев Толстой", "Классика", 1869, 600, "available", "Роман Л.Н. Толстого"),
+        ]
+        c.executemany("INSERT INTO books (title, author, category, year, price, status, description) VALUES (?, ?, ?, ?, ?, ?, ?)", books)
+    conn.commit()
+    conn.close()
+
+@app.before_first_request
+def setup():
+    init_db()
+
+# ---------- Auth ----------
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username, password = request.form['username'], request.form['password']
+        with db_connect() as conn:
+            user = conn.execute("SELECT * FROM users WHERE username=? AND password=?", (username, password)).fetchone()
+            if user:
+                session['user'] = dict(user)
+                return redirect(url_for('index'))
+            else:
+                flash("Неверные данные")
+    return render_template("login.html")
+
+@app.route("/logout")
+def logout():
+    session.pop('user', None)
+    return redirect(url_for('login'))
+
+# ---------- Index (user view/store) ----------
+@app.route("/")
+def index():
+    with db_connect() as conn:
+        q = "SELECT * FROM books"
+        params = []
+        # sorting/filter
+        filters = []
+        sort = request.args.get('sort')
+        for field in ['category', 'author', 'year']:
+            val = request.args.get(field)
+            if val and val != "":
+                filters.append(f"{field}=?")
+                params.append(val)
+        if filters:
+            q += " WHERE " + " AND ".join(filters)
+        if sort in ('category', 'author', 'year'):
+            q += " ORDER BY " + sort
+        books = conn.execute(q, params).fetchall()
+        cats = [row['category'] for row in conn.execute("SELECT DISTINCT category FROM books")]
+        authors = [row['author'] for row in conn.execute("SELECT DISTINCT author FROM books")]
+    return render_template("index.html", books=books, cats=cats, authors=authors, session=session)
+
+# ---------- Book view and order ----------
+@app.route("/book/<int:book_id>", methods=["GET","POST"])
+def book(book_id):
+    with db_connect() as conn:
+        book = conn.execute("SELECT * FROM books WHERE id=?", (book_id,)).fetchone()
+        if not book:
+            return "Нет книги", 404
+        if request.method == "POST":
+            if 'user' not in session:
+                return redirect(url_for('login'))
+            action = request.form['action']
+            user_id = session['user']['id']
+            if action == "buy" and book['status'] == 'available':
+                conn.execute("UPDATE books SET status='sold' WHERE id=?", (book_id,))
+                conn.execute("INSERT INTO orders (user_id, book_id, order_type, rent_period, rent_start, rent_end) VALUES (?,?,?,?,?,?)",
+                             (user_id, book_id, 'buy', None, None, None))
+            elif action.startswith("rent") and book['status'] == 'available':
+                period = action.split('_')[1]
+                today = datetime.date.today()
+                periods = {'2w': 14, '1m': 30, '3m': 90}
+                days = periods.get(period, 14)
+                rent_end = today + datetime.timedelta(days=days)
+                conn.execute("UPDATE books SET status='rented' WHERE id=?", (book_id,))
+                conn.execute("INSERT INTO orders (user_id, book_id, order_type, rent_period, rent_start, rent_end) VALUES (?,?,?,?,?,?)",
+                             (user_id, book_id, 'rent', period, today, rent_end))
+            conn.commit()
+            flash('Успешно оформлено!')
+            return redirect(url_for('index'))
+    return render_template("book.html", book=book, session=session)
+
+# ---------- Admin ----------
+@app.route("/admin", methods=["GET","POST"])
+def admin():
+    if 'user' not in session or session['user']['role']!="admin":
+        return redirect(url_for('login'))
+    with db_connect() as conn:
+        message = ""
+        # Add book
+        if request.method == "POST" and request.form.get('action')=="add":
+            dt = (
+                request.form['title'],
+                request.form['author'],
+                request.form['category'],
+                int(request.form['year']),
+                float(request.form['price']),
+                "available",
+                request.form['description']
+            )
+            conn.execute("INSERT INTO books (title, author, category, year, price, status, description) VALUES (?,?,?,?,?,?,?)", dt)
+            conn.commit()
+            message = "Книга добавлена"
+        # Update books
+        if request.method == "POST" and request.form.get('action')=="edit":
+            id = request.form['book_id']
+            conn.execute("UPDATE books SET title=?, author=?, category=?, year=?, price=?, status=?, description=? WHERE id=?",
+                (request.form['title'], request.form['author'], request.form['category'], int(request.form['year']), float(request.form['price']),
+                request.form['status'], request.form['description'], id)
+            )
+            conn.commit()
+            message = "Данные обновлены"
+        # Remove book
+        if request.method == "POST" and request.form.get('action')=="delete":
+            id = request.form['book_id']
+            conn.execute("DELETE FROM books WHERE id=?", (id,))
+            conn.commit()
+            message = "Книга удалена"
+        books = conn.execute("SELECT * FROM books").fetchall()
+    return render_template("admin.html", books=books, session=session, message=message)
+@app.before_request
+def check_rent_expiry():
+    # This is a simplified version - in production send emails or schedule tasks
+    with db_connect() as conn:
+        today = datetime.date.today().isoformat()
+        orders = conn.execute("SELECT o.*, u.email, b.title FROM orders o JOIN users u ON o.user_id=u.id JOIN books b on o.book_id=b.id WHERE o.order_type='rent' AND o.rent_end <= ? AND b.status='rented'", (today,))
+        for order in orders.fetchall():
+            flash(f"Напоминание: аренда '{order['title']}' для {order['email']} завершилась или скоро закончится.")
+
